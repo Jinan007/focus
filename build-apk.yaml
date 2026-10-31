@@ -1,0 +1,173 @@
+name: Build Android APK
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Write project files
+        run: |
+          cat > package.json <<'EOF'
+          {
+            "name": "focus-app",
+            "version": "1.0.0",
+            "private": true,
+            "dependencies": {
+              "@capacitor/android": "8.6.0",
+              "@capacitor/app": "8.1.2",
+              "@capacitor/core": "8.6.0",
+              "@capacitor/filesystem": "8.1.5",
+              "@capacitor/local-notifications": "8.3.1",
+              "@capacitor/share": "8.0.3",
+              "@capacitor-community/speech-recognition": "7.0.1",
+              "@fontsource-variable/archivo": "5.3.0",
+              "@fontsource-variable/hanken-grotesk": "5.3.0",
+              "@fontsource-variable/jetbrains-mono": "5.3.0"
+            },
+            "devDependencies": {
+              "@capacitor/cli": "8.6.0"
+            }
+          }
+          EOF
+          cat > capacitor.config.json <<'EOF'
+          {
+            "appId": "app.zaik.focus",
+            "appName": "Focus",
+            "webDir": "www",
+            "backgroundColor": "#fbfbfa",
+            "android": { "allowMixedContent": false },
+            "plugins": {
+              "LocalNotifications": { "smallIcon": "ic_stat_focus", "iconColor": "#0C0C0C" }
+            }
+          }
+          EOF
+          cat > setup_android.py <<'EOF'
+          import os, re
+          from PIL import Image, ImageDraw
+          main = "android/app/src/main"
+          res = main + "/res"
+
+          # ---- manifest ----
+          mp = main + "/AndroidManifest.xml"
+          m = open(mp).read()
+          perms = [
+           '<uses-permission android:name="android.permission.POST_NOTIFICATIONS" />',
+           '<uses-permission android:name="android.permission.VIBRATE" />',
+           '<uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />',
+           '<uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" android:maxSdkVersion="32" />',
+           '<uses-permission android:name="android.permission.USE_EXACT_ALARM" />',
+           '<uses-permission android:name="android.permission.RECORD_AUDIO" />',
+           '<uses-permission android:name="android.permission.CAMERA" />',
+           '<uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="28" />',
+           '<uses-feature android:name="android.hardware.camera" android:required="false" />',
+           '<uses-feature android:name="android.hardware.microphone" android:required="false" />',
+          ]
+          add = [p for p in perms if re.search(r'android:name="([^"]+)"', p).group(1) not in m]
+          if add:
+              m = m.replace("</manifest>", "    " + "\n    ".join(add) + "\n</manifest>")
+          if "screenOrientation" not in m:
+              m = m.replace('android:launchMode="singleTask"', 'android:launchMode="singleTask"\n            android:screenOrientation="portrait"')
+          if "RecognitionService" not in m:
+              m = m.replace("</manifest>", '    <queries>\n        <intent>\n            <action android:name="android.speech.RecognitionService" />\n        </intent>\n    </queries>\n</manifest>')
+          open(mp, "w").write(m)
+
+          # ---- splash colour ----
+          sp = res + "/values/styles.xml"
+          st = open(sp).read()
+          if "windowSplashScreenBackground" not in st:
+              st = st.replace('<item name="android:background">@drawable/splash</item>', '<item name="android:background">@drawable/splash</item>\n        <item name="windowSplashScreenBackground">#0C0C0C</item>')
+          open(sp, "w").write(st)
+
+          # ---- icons ----
+          INK = (12, 12, 12, 255); W = (251, 251, 250, 255)
+          def ring(sz, scale, round_mask=False, transparent=False, radius=0.22):
+              S = sz * 4
+              im = Image.new("RGBA", (S, S), (0, 0, 0, 0) if transparent else INK)
+              d = ImageDraw.Draw(im); c = S / 2; R = S * scale
+              d.ellipse([c - R, c - R, c + R, c + R], outline=W, width=int(S * 0.075))
+              r2 = S * 0.075
+              d.ellipse([c - r2, c - r2, c + r2, c + r2], fill=W)
+              if not transparent:
+                  mk = Image.new("L", (S, S), 0); md = ImageDraw.Draw(mk)
+                  if round_mask: md.ellipse([0, 0, S - 1, S - 1], fill=255)
+                  else: md.rounded_rectangle([0, 0, S - 1, S - 1], radius=int(S * radius), fill=255)
+                  out = Image.new("RGBA", (S, S), (0, 0, 0, 0)); out.paste(im, (0, 0), mk); im = out
+              return im.resize((sz, sz), Image.LANCZOS)
+          dens = {"mdpi": (48, 108), "hdpi": (72, 162), "xhdpi": (96, 216), "xxhdpi": (144, 324), "xxxhdpi": (192, 432)}
+          for k, (l, f) in dens.items():
+              d = "%s/mipmap-%s" % (res, k); os.makedirs(d, exist_ok=True)
+              ring(l, 0.30).save(d + "/ic_launcher.png")
+              ring(l, 0.30, round_mask=True).save(d + "/ic_launcher_round.png")
+              ring(f, 0.21, transparent=True).save(d + "/ic_launcher_foreground.png")
+          for root, _, files in os.walk(res):
+              for fn in files:
+                  if fn == "splash.png":
+                      p = os.path.join(root, fn); w, h = Image.open(p).size
+                      Image.new("RGB", (w, h), (12, 12, 12)).save(p)
+          open(res + "/values/ic_launcher_background.xml", "w").write('<?xml version="1.0" encoding="utf-8"?>\n<resources>\n    <color name="ic_launcher_background">#0C0C0C</color>\n</resources>\n')
+          os.makedirs(res + "/drawable", exist_ok=True)
+          open(res + "/drawable/ic_stat_focus.xml", "w").write('<?xml version="1.0" encoding="utf-8"?>\n<vector xmlns:android="http://schemas.android.com/apk/res/android" android:width="24dp" android:height="24dp" android:viewportWidth="24" android:viewportHeight="24">\n    <path android:fillColor="#FFFFFF" android:fillType="evenOdd" android:pathData="M12,2.5A9.5,9.5 0 1,0 12,21.5A9.5,9.5 0 1,0 12,2.5ZM12,5A7,7 0 1,1 12,19A7,7 0 1,1 12,5Z" />\n    <path android:fillColor="#FFFFFF" android:pathData="M12,10.2A1.8,1.8 0 1,0 12,13.8A1.8,1.8 0 1,0 12,10.2Z" />\n</vector>\n')
+          print("Android project patched.")
+          EOF
+
+      - name: Install packages
+        run: |
+          npm install --no-audit --no-fund
+          pip install pillow
+
+      - name: Prepare the web app
+        run: |
+          mkdir -p www/fonts
+          cp index.html www/index.html
+          cp node_modules/@fontsource-variable/archivo/files/archivo-latin-wdth-normal.woff2 www/fonts/
+          cp node_modules/@fontsource-variable/hanken-grotesk/files/hanken-grotesk-latin-wght-normal.woff2 www/fonts/
+          cp node_modules/@fontsource-variable/jetbrains-mono/files/jetbrains-mono-latin-wght-normal.woff2 www/fonts/
+
+      - name: Create the Android project
+        run: |
+          npx cap add android
+          python3 setup_android.py
+          npx cap sync android
+
+      - name: Use the fixed signing key so updates install over older builds
+        run: |
+          mkdir -p ~/.android
+          echo "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" | base64 -d > ~/.android/debug.keystore
+
+      - name: Build the APK
+        working-directory: android
+        run: ./gradlew assembleDebug --no-daemon
+
+      - name: Keep the APK as a build file
+        uses: actions/upload-artifact@v4
+        with:
+          name: Focus-apk
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+
+      - name: Publish a release with the APK
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp android/app/build/outputs/apk/debug/app-debug.apk Focus.apk
+          gh release create "build-${{ github.run_number }}" Focus.apk --title "Focus build ${{ github.run_number }}" --notes "Install Focus.apk on your Android phone. Updating keeps your data." --latest
